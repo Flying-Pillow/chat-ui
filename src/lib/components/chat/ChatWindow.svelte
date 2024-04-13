@@ -86,7 +86,11 @@
 	const convTreeStore = useConvTreeStore();
 
 	$: lastMessage = browser && (messages.find((m) => m.id == $convTreeStore.leaf) as Message);
-	$: lastIsError = lastMessage && lastMessage.from === "user" && !loading;
+	$: lastIsError =
+		lastMessage &&
+		!loading &&
+		(lastMessage.from === "user" ||
+			lastMessage.updates?.findIndex((u) => u.type === "status" && u.status === "error") !== -1);
 
 	$: sources = files.map((file) => file2base64(file));
 
@@ -134,7 +138,7 @@
 		bind:this={chatContainer}
 	>
 		<div class="mx-auto flex h-full max-w-3xl flex-col gap-6 px-5 pt-6 sm:gap-8 xl:max-w-4xl">
-			{#if $page.data?.assistant}
+			{#if $page.data?.assistant && !!messages.length}
 				<a
 					class="mx-auto flex items-center gap-1.5 rounded-full border border-gray-100 bg-gray-50 py-1 pl-1 pr-3 text-sm text-gray-800 hover:bg-gray-100 dark:border-gray-800 dark:bg-gray-800 dark:text-gray-200 dark:hover:bg-gray-700"
 					href="{base}/settings/assistants/{$page.data.assistant._id}"
@@ -191,9 +195,30 @@
 					model={currentModel}
 				/>
 			{:else if !assistant}
-				<ChatIntroduction {models} {currentModel} on:message />
+				<ChatIntroduction
+					{models}
+					{currentModel}
+					on:message={(ev) => {
+						if ($page.data.loginRequired) {
+							ev.preventDefault();
+							loginModalOpen = true;
+						} else {
+							dispatch("message", ev.detail);
+						}
+					}}
+				/>
 			{:else}
-				<AssistantIntroduction {assistant} on:message />
+				<AssistantIntroduction
+					{assistant}
+					on:message={(ev) => {
+						if ($page.data.loginRequired) {
+							ev.preventDefault();
+							loginModalOpen = true;
+						} else {
+							dispatch("message", ev.detail);
+						}
+					}}
+				/>
 			{/if}
 		</div>
 		<ScrollToBottomBtn
@@ -242,7 +267,7 @@
 						on:click={() => {
 							if (lastMessage && lastMessage.ancestors) {
 								dispatch("retry", {
-									id: lastMessage.ancestors[lastMessage.ancestors.length - 1],
+									id: lastMessage.id,
 								});
 							}
 						}}
@@ -284,7 +309,9 @@
 							<ChatInput value="Sorry, something went wrong. Please try again." disabled={true} />
 						{:else}
 							<ChatInput
-								placeholder="Ask anything"
+								placeholder={isReadOnly
+									? "This conversation is read-only. Start a new one to continue!"
+									: "Ask anything"}
 								bind:value={message}
 								on:submit={handleSubmit}
 								on:beforeinput={(ev) => {
@@ -328,16 +355,33 @@
 				<p>
 					Model:
 					{#if !assistant}
-						<a href="{base}/settings/{currentModel.id}" class="hover:underline"
-							>{currentModel.displayName}</a
-						>{:else}
+						{#if models.find((m) => m.id === currentModel.id)}
+							<a
+								href="{base}/settings/{currentModel.id}"
+								class="inline-flex items-center hover:underline"
+								>{currentModel.displayName}<CarbonCaretDown class="text-xxs" /></a
+							>
+						{:else}
+							<span class="inline-flex items-center line-through dark:border-gray-700">
+								{currentModel.id}
+							</span>
+						{/if}
+					{:else}
 						{@const model = models.find((m) => m.id === assistant?.modelId)}
-						<a
-							href="{base}/settings/assistants/{assistant._id}"
-							class="inline-flex items-center border-b hover:text-gray-600 dark:border-gray-700 dark:hover:text-gray-300"
-							>{model?.displayName}<CarbonCaretDown class="text-xxs" /></a
-						>{/if} <span class="max-sm:hidden">·</span><br class="sm:hidden" /> Generated content may
-					be inaccurate or false.
+						{#if model}
+							<a
+								href="{base}/settings/assistants/{assistant._id}"
+								class="inline-flex items-center border-b hover:text-gray-600 dark:border-gray-700 dark:hover:text-gray-300"
+								>{model?.displayName}<CarbonCaretDown class="text-xxs" /></a
+							>
+						{:else}
+							<span class="inline-flex items-center line-through dark:border-gray-700">
+								{currentModel.id}
+							</span>
+						{/if}
+					{/if}
+					<span class="max-sm:hidden">·</span><br class="sm:hidden" /> Generated content may be inaccurate
+					or false.
 				</p>
 				{#if messages.length}
 					<button

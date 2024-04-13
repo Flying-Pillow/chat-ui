@@ -7,6 +7,9 @@ import { ObjectId } from "mongodb";
 import { z } from "zod";
 import { sha256 } from "$lib/utils/sha256";
 import sharp from "sharp";
+import { parseStringToList } from "$lib/utils/parseStringToList";
+import { usageLimits } from "$lib/server/usageLimits";
+import { generateSearchTokens } from "$lib/utils/searchTokens";
 
 const newAsssistantSchema = z.object({
 	name: z.string().min(1),
@@ -18,6 +21,24 @@ const newAsssistantSchema = z.object({
 	exampleInput3: z.string().optional(),
 	exampleInput4: z.string().optional(),
 	avatar: z.instanceof(File).optional(),
+	ragLinkList: z.preprocess(parseStringToList, z.string().url().array().max(10)),
+	ragDomainList: z.preprocess(parseStringToList, z.string().array()),
+	ragAllowAll: z.preprocess((v) => v === "true", z.boolean()),
+	dynamicPrompt: z.preprocess((v) => v === "on", z.boolean()),
+	temperature: z
+		.union([z.literal(""), z.coerce.number().min(0.1).max(2)])
+		.transform((v) => (v === "" ? undefined : v)),
+	top_p: z
+		.union([z.literal(""), z.coerce.number().min(0.05).max(1)])
+		.transform((v) => (v === "" ? undefined : v)),
+
+	repetition_penalty: z
+		.union([z.literal(""), z.coerce.number().min(0.1).max(2)])
+		.transform((v) => (v === "" ? undefined : v)),
+
+	top_k: z
+		.union([z.literal(""), z.coerce.number().min(5).max(100)])
+		.transform((v) => (v === "" ? undefined : v)),
 });
 
 const uploadAvatar = async (avatar: File, assistantId: ObjectId): Promise<string> => {
@@ -63,6 +84,18 @@ export const actions: Actions = {
 
 		const createdById = locals.user?._id ?? locals.sessionId;
 
+		const assistantsCount = await collections.assistants.countDocuments({ createdById });
+
+		if (usageLimits?.assistants && assistantsCount > usageLimits.assistants) {
+			const errors = [
+				{
+					field: "preprompt",
+					message: "You have reached the maximum number of assistants. Delete some to continue.",
+				},
+			];
+			return fail(400, { error: true, errors });
+		}
+
 		const newAssistantId = new ObjectId();
 
 		const exampleInputs: string[] = [
@@ -99,6 +132,20 @@ export const actions: Actions = {
 			updatedAt: new Date(),
 			userCount: 1,
 			featured: false,
+			rag: {
+				allowedLinks: parse.data.ragLinkList,
+				allowedDomains: parse.data.ragDomainList,
+				allowAllDomains: parse.data.ragAllowAll,
+			},
+			dynamicPrompt: parse.data.dynamicPrompt,
+			searchTokens: generateSearchTokens(parse.data.name),
+			last24HoursCount: 0,
+			generateSettings: {
+				temperature: parse.data.temperature,
+				top_p: parse.data.top_p,
+				repetition_penalty: parse.data.repetition_penalty,
+				top_k: parse.data.top_k,
+			},
 		});
 
 		// add insertedId to user settings

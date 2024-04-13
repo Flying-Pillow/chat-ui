@@ -4,10 +4,9 @@
 	import { isAborted } from "$lib/stores/isAborted";
 	import { onMount } from "svelte";
 	import { page } from "$app/stores";
-	import { goto, invalidate } from "$app/navigation";
+	import { goto, invalidateAll } from "$app/navigation";
 	import { base } from "$app/paths";
 	import { shareConversation } from "$lib/shareConversation";
-	import { UrlDependency } from "$lib/types/UrlDependency";
 	import { ERROR_MESSAGES, error } from "$lib/stores/errors";
 	import { findCurrentModel } from "$lib/utils/models";
 	import { webSearchParameters } from "$lib/stores/webSearchParameters";
@@ -17,18 +16,13 @@
 	import file2base64 from "$lib/utils/file2base64";
 	import { addChildren } from "$lib/utils/tree/addChildren";
 	import { addSibling } from "$lib/utils/tree/addSibling";
+	import { fetchMessageUpdates } from "$lib/utils/messageUpdates";
 	import { createConvTreeStore } from "$lib/stores/convTree";
+	import type { v4 } from "uuid";
 
 	export let data;
 
-	let messages = data.messages;
-	let lastLoadedMessages = data.messages;
-
-	// Since we modify the messages array locally, we don't want to reset it if an old version is passed
-	$: if (data.messages !== lastLoadedMessages) {
-		messages = data.messages;
-		lastLoadedMessages = data.messages;
-	}
+	$: ({ messages } = data);
 
 	let loading = false;
 	let pending = false;
@@ -50,7 +44,7 @@
 			});
 
 			if (!res.ok) {
-				error.set("Error while creating conversation, try again.");
+				error.set(await res.text());
 				console.error("Error while creating conversation: " + (await res.text()));
 				return;
 			}
@@ -72,7 +66,7 @@
 		isContinue = false,
 	}: {
 		prompt?: string;
-		messageId?: ReturnType<typeof crypto.randomUUID>;
+		messageId?: ReturnType<typeof v4>;
 		isRetry?: boolean;
 		isContinue?: boolean;
 	}): Promise<void> {
@@ -188,125 +182,74 @@
 
 			messages = [...messages];
 			const messageToWriteTo = messages.find((message) => message.id === messageToWriteToId);
-
 			if (!messageToWriteTo) {
 				throw new Error("Message to write to not found");
 			}
+
 			// disable websearch if assistant is present
 			const hasAssistant = !!$page.data.assistant;
-
-			const response = await fetch(`${base}/conversation/${$page.params.id}`, {
-				method: "POST",
-				headers: { "Content-Type": "application/json" },
-				body: JSON.stringify({
+			const messageUpdatesAbortController = new AbortController();
+			const messageUpdatesIterator = await fetchMessageUpdates(
+				$page.params.id,
+				{
+					base,
 					inputs: prompt,
-					id: messageId,
-					is_retry: isRetry,
-					is_continue: isContinue,
-					web_search: !hasAssistant && $webSearchParameters.useSearch,
+					messageId,
+					isRetry,
+					isContinue,
+					webSearch: !hasAssistant && $webSearchParameters.useSearch,
 					files: isRetry ? undefined : resizedImages,
-				}),
+				},
+				messageUpdatesAbortController.signal
+			).catch((err) => {
+				error.set(err.message);
 			});
+			if (messageUpdatesIterator === undefined) return;
 
 			files = [];
-			if (!response.body) {
-				throw new Error("Body not defined");
-			}
 
-			if (!response.ok) {
-				error.set((await response.json())?.message);
-				return;
-			}
-
-			// eslint-disable-next-line no-undef
-			const encoder = new TextDecoderStream();
-			const reader = response?.body?.pipeThrough(encoder).getReader();
-			let finalAnswer = "";
 			const messageUpdates: MessageUpdate[] = [];
-
-			// set str queue
-			// ex) if the last response is => {"type": "stream", "token":
-			// It should be => {"type": "stream", "token": "Hello"} = prev_input_chunk + "Hello"}
-			let prev_input_chunk = [""];
-
-			// this is a bit ugly
-			// we read the stream until we get the final answer
-			while (finalAnswer === "") {
-				// check for abort
+			for await (const update of messageUpdatesIterator) {
 				if ($isAborted) {
-					reader?.cancel();
+					messageUpdatesAbortController.abort();
+					return;
+				}
+				if (update.type === "finalAnswer") {
+					loading = false;
+					pending = false;
 					break;
 				}
 
-				// if there is something to read
-				await reader?.read().then(async ({ done, value }) => {
-					// we read, if it's done we cancel
-					if (done) {
-						reader.cancel();
-						return;
-					}
+				messageUpdates.push(update);
 
-					if (!value) {
-						return;
-					}
+				if (update.type === "stream") {
+					pending = false;
+					messageToWriteTo.content += update.token;
+					messages = [...messages];
+				} else if (update.type === "webSearch") {
+					messageToWriteTo.updates = [...(messageToWriteTo.updates ?? []), update];
+					messages = [...messages];
+				} else if (update.type === "status") {
+					if (update.status === "title" && update.message) {
+						const convInData = data.conversations.find(({ id }) => id === $page.params.id);
+						if (convInData) {
+							convInData.title = update.message;
 
-					value = prev_input_chunk.pop() + value;
-
-					// if it's not done we parse the value, which contains all messages
-					const inputs = value.split("\n");
-					inputs.forEach(async (el: string) => {
-						try {
-							const update = JSON.parse(el) as MessageUpdate;
-
-							if (update.type !== "stream") {
-								messageUpdates.push(update);
-							}
-
-							if (update.type === "finalAnswer") {
-								finalAnswer = update.text;
-								reader.cancel();
-								loading = false;
-								pending = false;
-								invalidate(UrlDependency.Conversation);
-							} else if (update.type === "stream") {
-								pending = false;
-								messageToWriteTo.content += update.token;
-								messages = [...messages];
-							} else if (update.type === "webSearch") {
-								messageToWriteTo.updates = [...(messageToWriteTo.updates ?? []), update];
-								messages = [...messages];
-							} else if (update.type === "status") {
-								if (update.status === "title" && update.message) {
-									const convInData = data.conversations.find(({ id }) => id === $page.params.id);
-									if (convInData) {
-										convInData.title = update.message;
-
-										$titleUpdate = {
-											title: update.message,
-											convId: $page.params.id,
-										};
-									}
-								} else if (update.status === "error") {
-									$error = update.message ?? "An error has occurred";
-								}
-							} else if (update.type === "error") {
-								error.set(update.message);
-								reader.cancel();
-							}
-						} catch (parseError) {
-							// in case of parsing error we wait for the next message
-
-							if (el === inputs[inputs.length - 1]) {
-								prev_input_chunk.push(el);
-							}
-							return;
+							$titleUpdate = {
+								title: update.message,
+								convId: $page.params.id,
+							};
 						}
-					});
-				});
+					} else if (update.status === "error") {
+						$error = update.message ?? "An error has occurred";
+					}
+				} else if (update.type === "error") {
+					error.set(update.message);
+					messageUpdatesAbortController.abort();
+				}
 			}
 
 			messageToWriteTo.updates = messageUpdates;
-			await invalidate(UrlDependency.ConversationList);
 		} catch (err) {
 			if (err instanceof Error && err.message.includes("overloaded")) {
 				$error = "Too much traffic, please try again.";
@@ -321,7 +264,7 @@
 		} finally {
 			loading = false;
 			pending = false;
-			await invalidate(UrlDependency.Conversation);
+			await invalidateAll();
 		}
 	}
 

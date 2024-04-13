@@ -120,7 +120,7 @@ TEXT_EMBEDDING_MODELS = `[
 ```
 
 The required fields are `name`, `chunkCharLength` and `endpoints`.
-Supported text embedding backends are: [`transformers.js`](https://huggingface.co/docs/transformers.js) and [`TEI`](https://github.com/huggingface/text-embeddings-inference). `transformers.js` models run locally as part of `chat-ui`, whereas `TEI` models run in a different environment & accessed through an API endpoint.
+Supported text embedding backends are: [`transformers.js`](https://huggingface.co/docs/transformers.js), [`TEI`](https://github.com/huggingface/text-embeddings-inference) and [`OpenAI`](https://platform.openai.com/docs/guides/embeddings). `transformers.js` models run locally as part of `chat-ui`, whereas `TEI` models run in a different environment & accessed through an API endpoint. `openai` models are accessed through the [OpenAI API](https://platform.openai.com/docs/guides/embeddings).
 
 When more than one embedding models are supplied in `.env.local` file, the first will be used by default, and the others will only be used on LLM's which configured `embeddingModel` to the name of the model.
 
@@ -459,6 +459,51 @@ MODELS=`[
 ]`
 ```
 
+#### Anthropic
+
+We also support Anthropic models through the official SDK. You may provide your API key via the `ANTHROPIC_API_KEY` env variable, or alternatively, through the `endpoints.apiKey` as per the following example.
+
+```
+MODELS=`[
+  {
+      "name": "claude-3-sonnet-20240229",
+      "displayName": "Claude 3 Sonnet",
+      "description": "Ideal balance of intelligence and speed",
+      "parameters": {
+        "max_new_tokens": 4096,
+      },
+      "endpoints": [
+        {
+          "type": "anthropic",
+          // optionals
+          "apiKey": "sk-ant-...",
+          "baseURL": "https://api.anthropic.com",
+          defaultHeaders: {},
+          defaultQuery: {}
+        }
+      ]
+  },
+  {
+      "name": "claude-3-opus-20240229",
+      "displayName": "Claude 3 Opus",
+      "description": "Most powerful model for highly complex tasks",
+      "parameters": {
+         "max_new_tokens": 4096
+      },
+      "endpoints": [
+        {
+          "type": "anthropic",
+          // optionals
+          "apiKey": "sk-ant-...",
+          "baseURL": "https://api.anthropic.com",
+          defaultHeaders: {},
+          defaultQuery: {}
+        }
+      ]
+  }
+]`
+```
+
 #### Amazon
 
 You can also specify your Amazon SageMaker instance as an endpoint for chat-ui. The config goes like this:
@@ -482,6 +527,96 @@ You can also specify your Amazon SageMaker instance as an endpoint for chat-ui. 
 You can also set `"service" : "lambda"` to use a lambda instance.
 
 You can get the `accessKey` and `secretKey` from your AWS user, under programmatic access.
+
+#### Cloudflare Workers AI
+
+You can also use Cloudflare Workers AI to run your own models with serverless inference.
+
+You will need to have a Cloudflare account, then get your [account ID](https://developers.cloudflare.com/fundamentals/setup/find-account-and-zone-ids/) as well as your [API token](https://developers.cloudflare.com/workers-ai/get-started/rest-api/#1-get-an-api-token) for Workers AI.
+
+You can either specify them directly in your `.env.local` using the `CLOUDFLARE_ACCOUNT_ID` and `CLOUDFLARE_API_TOKEN` variables, or you can set them directly in the endpoint config.
+
+You can find the list of models available on Cloudflare [here](https://developers.cloudflare.com/workers-ai/models/#text-generation).
+
+```env
+  {
+  "name" : "nousresearch/hermes-2-pro-mistral-7b",
+  "tokenizer": "nousresearch/hermes-2-pro-mistral-7b",
+  "parameters": {
+    "stop": ["<|im_end|>"]
+  },
+  "endpoints" : [
+    {
+      "type" : "cloudflare"
+      <!-- optionally specify these
+      "accountId": "your-account-id",
+      "authToken": "your-api-token"
+      -->
+    }
+  ]
+}
+```
+
+> [!NOTE]  
+> Cloudlare Workers AI currently do not support custom sampling parameters like temperature, top_p, etc.
+
+#### Cohere
+
+You can also use Cohere to run their models directly from chat-ui. You will need to have a Cohere account, then get your [API token](https://dashboard.cohere.com/api-keys). You can either specify it directly in your `.env.local` using the `COHERE_API_TOKEN` variable, or you can set it in the endpoint config.
+
+Here is an example of a Cohere model config. You can set which model you want to use by setting the `id` field to the model name.
+
+```env
+  {
+    "name" : "CohereForAI/c4ai-command-r-v01",
+    "id": "command-r",
+    "description": "C4AI Command-R is a research release of a 35 billion parameter highly performant generative model",
+    "endpoints": [
+      {
+        "type": "cohere",
+        <!-- optionally specify these, or use COHERE_API_TOKEN
+        "apiKey": "your-api-token"
+        -->
+      }
+    ]
+  }
+```
+
+##### Google Vertex models
+
+Chat UI can connect to the google Vertex API endpoints ([List of supported models](https://cloud.google.com/vertex-ai/generative-ai/docs/learn/models)).
+
+To enable:
+
+1.  [Select](https://console.cloud.google.com/project) or [create](https://cloud.google.com/resource-manager/docs/creating-managing-projects#creating_a_project) a Google Cloud project.
+1.  [Enable billing for your project](https://cloud.google.com/billing/docs/how-to/modify-project).
+1.  [Enable the Vertex AI API](https://console.cloud.google.com/flows/enableapi?apiid=aiplatform.googleapis.com).
+1.  [Set up authentication with a service account](https://cloud.google.com/docs/authentication/getting-started)
+    so you can access the API from your local workstation.
+
+The service account credentials file can be imported as an environmental variable:
+
+```env
+    GOOGLE_APPLICATION_CREDENTIALS = clientid.json
+```
+
+Make sure docker has access to the file. Afterwards Google Vertex endpoints can be configured as following:
+
+```
+MODELS=`[
+//...
+    {
+       "name": "gemini-1.0-pro", //model-name
+       "displayName": "Vertex Gemini Pro 1.0",
+       "location": "europe-west3",
+       "apiEndpoint": "", //alternative api endpoint url
+       "endpoints" : [{
+         "type": "vertex"
+       }]
+     },
+]`
+
+```
 
 ### Custom endpoint authorization
 
@@ -616,3 +751,37 @@ npm run updateLocalEnv
 ```
 
 This will replace your `.env.local` file with the one that will be used in prod (simply taking `.env.template + .env.SECRET_CONFIG`).
+
+### Populate database
+
+> [!WARNING]  
+> The `MONGODB_URL` used for this script will be fetched from `.env.local`. Make sure it's correct! The command runs directly on the database.
+
+You can populate the database using faker data using the `populate` script:
+
+```bash
+npm run populate <flags here>
+```
+
+At least one flag must be specified, the following flags are available:
+
+- `reset` - resets the database
+- `all` - populates all tables
+- `users` - populates the users table
+- `settings` - populates the settings table for existing users
+- `assistants` - populates the assistants table for existing users
+- `conversations` - populates the conversations table for existing users
+
+For example, you could use it like so:
+
+```bash
+npm run populate reset
+```
+
+to clear out the database. Then login in the app to create your user and run the following command:
+
+```bash
+npm run populate users settings assistants conversations
+```
+
+to populate the database with fake data, including fake conversations and assistants for your user.

@@ -1,4 +1,5 @@
-import { MESSAGES_BEFORE_LOGIN, RATE_LIMIT } from "$env/static/private";
+import { MESSAGES_BEFORE_LOGIN, ENABLE_ASSISTANTS_RAG } from "$env/static/private";
+import { startOfHour } from "date-fns";
 import { authCondition, requiresUser } from "$lib/server/auth";
 import { collections } from "$lib/server/database";
 import { models } from "$lib/server/models";
@@ -13,12 +14,15 @@ import { abortedGenerations } from "$lib/server/abortedGenerations";
 import { summarize } from "$lib/server/summarize";
 import { uploadFile } from "$lib/server/files/uploadFile";
 import sizeof from "image-size";
+import type { Assistant } from "$lib/types/Assistant";
 import { convertLegacyConversation } from "$lib/utils/tree/convertLegacyConversation";
 import { isMessageId } from "$lib/utils/tree/isMessageId";
 import { buildSubtree } from "$lib/utils/tree/buildSubtree.js";
 import { addChildren } from "$lib/utils/tree/addChildren.js";
 import { addSibling } from "$lib/utils/tree/addSibling.js";
 import { preprocessMessages } from "$lib/server/preprocessMessages.js";
+import { usageLimits } from "$lib/server/usageLimits";
+import { isURLLocal } from "$lib/server/isURLLocal.js";
 
 export async function POST({ request, locals, params, getClientAddress }) {
 	const id = z.string().parse(params.id);
@@ -72,18 +76,17 @@ export async function POST({ request, locals, params, getClientAddress }) {
 		ip: getClientAddress(),
 	});
 
+	const messagesBeforeLogin = MESSAGES_BEFORE_LOGIN ? parseInt(MESSAGES_BEFORE_LOGIN) : 0;
+
 	// guest mode check
-	if (
-		!locals.user?._id &&
-		requiresUser &&
-		(MESSAGES_BEFORE_LOGIN ? parseInt(MESSAGES_BEFORE_LOGIN) : 0) > 0
-	) {
+	if (!locals.user?._id && requiresUser && messagesBeforeLogin) {
 		const totalMessages =
 			(
 				await collections.conversations
 					.aggregate([
-						{ $match: authCondition(locals) },
+						{ $match: { ...authCondition(locals), "messages.from": "assistant" } },
 						{ $project: { messages: 1 } },
+						{ $limit: messagesBeforeLogin + 1 },
 						{ $unwind: "$messages" },
 						{ $match: { "messages.from": "assistant" } },
 						{ $count: "messages" },
@@ -91,19 +94,27 @@ export async function POST({ request, locals, params, getClientAddress }) {
 					.toArray()
 			)[0]?.messages ?? 0;
 
-		if (totalMessages > parseInt(MESSAGES_BEFORE_LOGIN)) {
+		if (totalMessages > messagesBeforeLogin) {
 			throw error(429, "Exceeded number of messages before login");
 		}
 	}
 
-	// check if the user is rate limited
-	const nEvents = Math.max(
-		await collections.messageEvents.countDocuments({ userId }),
-		await collections.messageEvents.countDocuments({ ip: getClientAddress() })
-	);
+	if (usageLimits?.messagesPerMinute) {
+		// check if the user is rate limited
+		const nEvents = Math.max(
+			await collections.messageEvents.countDocuments({ userId }),
+			await collections.messageEvents.countDocuments({ ip: getClientAddress() })
+		);
+		if (nEvents > usageLimits.messagesPerMinute) {
+			throw error(429, ERROR_MESSAGES.rateLimited);
+		}
+	}
 
-	if (RATE_LIMIT != "" && nEvents > parseInt(RATE_LIMIT)) {
-		throw error(429, ERROR_MESSAGES.rateLimited);
+	if (usageLimits?.messages && conv.messages.length > usageLimits.messages) {
+		throw error(
+			429,
+			`This conversation has more than ${usageLimits.messages} messages. Start a new one to continue`
+		);
 	}
 
 	// fetch the model
@@ -126,7 +137,13 @@ export async function POST({ request, locals, params, getClientAddress }) {
 	} = z
 		.object({
 			id: z.string().uuid().refine(isMessageId).optional(), // parent message id to append to for a normal message, or the message id for a retry/continue
-			inputs: z.optional(z.string().trim().min(1)),
+			inputs: z.optional(
+				z
+					.string()
+					.trim()
+					.min(1)
+					.transform((s) => s.replace(/\r\n/g, "\n"))
+			),
 			is_retry: z.optional(z.boolean()),
 			is_continue: z.optional(z.boolean()),
 			web_search: z.optional(z.boolean()),
@@ -134,6 +151,9 @@ export async function POST({ request, locals, params, getClientAddress }) {
 		})
 		.parse(json);
 
+	if (usageLimits?.messageLength && (newPrompt?.length ?? 0) > usageLimits.messageLength) {
+		throw error(400, "Message too long.");
+	}
 	// files is an array of base64 strings encoding Blob objects
 	// we need to convert this array to an array of File objects
 
@@ -317,35 +337,103 @@ export async function POST({ request, locals, params, getClientAddress }) {
 				}
 			);
 
+			// check if assistant has a rag
+			const assistant = await collections.assistants.findOne<
+				Pick<Assistant, "rag" | "dynamicPrompt" | "generateSettings">
+			>(
+				{ _id: conv.assistantId },
+				{ projection: { rag: 1, dynamicPrompt: 1, generateSettings: 1 } }
+			);
+
+			const assistantHasRAG =
+				ENABLE_ASSISTANTS_RAG === "true" &&
+				assistant &&
+				((assistant.rag &&
+					(assistant.rag.allowedLinks.length > 0 ||
+						assistant.rag.allowedDomains.length > 0 ||
+						assistant.rag.allowAllDomains)) ||
+					assistant.dynamicPrompt);
+
 			// perform websearch if needed
-			if (webSearch && !isContinue && !conv.assistantId) {
-				messageToWriteTo.webSearch = await runWebSearch(conv, messagesForPrompt, update);
+			if (
+				!isContinue &&
+				((webSearch && !conv.assistantId) || (assistantHasRAG && !assistant.dynamicPrompt))
+			) {
+				messageToWriteTo.webSearch = await runWebSearch(
+					conv,
+					messagesForPrompt,
+					update,
+					assistant?.rag
+				);
+			}
+
+			let preprompt = conv.preprompt;
+
+			if (assistant?.dynamicPrompt && preprompt && ENABLE_ASSISTANTS_RAG === "true") {
+				// process the preprompt
+				const urlRegex = /{{\s?url=(.*?)\s?}}/g;
+				let match;
+				while ((match = urlRegex.exec(preprompt)) !== null) {
+					try {
+						const url = new URL(match[1]);
+						if (await isURLLocal(url)) {
+							throw new Error("URL couldn't be fetched, it resolved to a local address.");
+						}
+
+						const res = await fetch(url.href);
+
+						if (!res.ok) {
+							throw new Error("URL couldn't be fetched, error " + res.status);
+						}
+						const text = await res.text();
+						preprompt = preprompt.replaceAll(match[0], text);
+					} catch (e) {
+						preprompt = preprompt.replaceAll(match[0], (e as Error).message);
+					}
+				}
+
+				if (messagesForPrompt[0].from === "system") {
+					messagesForPrompt[0].content = preprompt;
+				}
 			}
 
 			// inject websearch result & optionally images into the messages
 			const processedMessages = await preprocessMessages(
 				messagesForPrompt,
+				messageToWriteTo.webSearch,
 				model.multimodal,
 				convId
 			);
 
 			const previousText = messageToWriteTo.content;
 
+			let hasError = false;
+
+			let buffer = "";
+
 			try {
 				const endpoint = await model.getEndpoint();
 				for await (const output of await endpoint({
 					messages: processedMessages,
-					preprompt: conv.preprompt,
+					preprompt,
 					continueMessage: isContinue,
+					generateSettings: assistant?.generateSettings,
 				})) {
 					// if not generated_text is here it means the generation is not done
 					if (!output.generated_text) {
-						// else we get the next token
 						if (!output.token.special) {
-							update({
-								type: "stream",
-								token: output.token.text,
-							});
+							buffer += output.token.text;
+
+							// send the first 5 chars
+							// and leave the rest in the buffer
+							if (buffer.length >= 5) {
+								update({
+									type: "stream",
+									token: buffer.slice(0, 5),
+								});
+								buffer = buffer.slice(5);
+							}
+
 							// abort check
 							const date = abortedGenerations.get(convId.toString());
 							if (date && date > promptedAt) {
@@ -376,7 +464,24 @@ export async function POST({ request, locals, params, getClientAddress }) {
 					}
 				}
 			} catch (e) {
+				hasError = true;
 				update({ type: "status", status: "error", message: (e as Error).message });
+			} finally {
+				// check if no output was generated
+				if (!hasError && messageToWriteTo.content === previousText) {
+					update({
+						type: "status",
+						status: "error",
+						message: "No output was generated. Something went wrong.",
+					});
+				}
+
+				if (buffer) {
+					update({
+						type: "stream",
+						token: buffer,
+					});
+				}
 			}
 
 			await collections.conversations.updateOne(
@@ -421,6 +526,14 @@ export async function POST({ request, locals, params, getClientAddress }) {
 			}
 		},
 	});
+
+	if (conv.assistantId) {
+		await collections.assistantStats.updateOne(
+			{ assistantId: conv.assistantId, "date.at": startOfHour(new Date()), "date.span": "hour" },
+			{ $inc: { count: 1 } },
+			{ upsert: true }
+		);
+	}
 
 	// Todo: maybe we should wait for the message to be saved before ending the response - in case of errors
 	return new Response(stream, {

@@ -7,19 +7,6 @@ import { PUBLIC_ORIGIN, PUBLIC_SHARE_PREFIX } from "$env/static/public";
 import { WEBHOOK_URL_REPORT_ASSISTANT } from "$env/static/private";
 import { z } from "zod";
 import type { Assistant } from "$lib/types/Assistant";
-
-export async function load({ params }) {
-	const assistant = await collections.assistants.findOne({
-		_id: new ObjectId(params.assistantId),
-	});
-
-	if (!assistant) {
-		throw redirect(302, `${base}/assistant/${params.assistantId}`);
-	}
-
-	return { assistant: JSON.parse(JSON.stringify(assistant)) };
-}
-
 async function assistantOnlyIfAuthor(locals: App.Locals, assistantId?: string) {
 	const assistant = await collections.assistants.findOne({ _id: new ObjectId(assistantId) });
 
@@ -70,8 +57,8 @@ export const actions: Actions = {
 	report: async ({ request, params, locals, url }) => {
 		// is there already a report from this user for this model ?
 		const report = await collections.reports.findOne({
-			assistantId: new ObjectId(params.assistantId),
 			createdBy: locals.user?._id ?? locals.sessionId,
+			assistantId: new ObjectId(params.assistantId),
 		});
 
 		if (report) {

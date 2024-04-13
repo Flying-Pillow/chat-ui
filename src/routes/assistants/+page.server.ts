@@ -1,8 +1,9 @@
 import { base } from "$app/paths";
 import { ENABLE_ASSISTANTS } from "$env/static/private";
 import { collections } from "$lib/server/database.js";
-import type { Assistant } from "$lib/types/Assistant";
+import { SortKey, type Assistant } from "$lib/types/Assistant";
 import type { User } from "$lib/types/User";
+import { generateQueryTokens } from "$lib/utils/searchTokens.js";
 import { error, redirect } from "@sveltejs/kit";
 import type { Filter } from "mongodb";
 
@@ -16,6 +17,8 @@ export const load = async ({ url, locals }) => {
 	const modelId = url.searchParams.get("modelId");
 	const pageIndex = parseInt(url.searchParams.get("p") ?? "0");
 	const username = url.searchParams.get("user");
+	const query = url.searchParams.get("q")?.trim() ?? null;
+	const sort = url.searchParams.get("sort")?.trim() ?? SortKey.POPULAR;
 	const createdByCurrentUser = locals.user?.username && locals.user.username === username;
 
 	let user: Pick<User, "_id"> | null = null;
@@ -34,11 +37,15 @@ export const load = async ({ url, locals }) => {
 		...(modelId && { modelId }),
 		...(!createdByCurrentUser && { userCount: { $gt: 1 } }),
 		...(user ? { createdById: user._id } : { featured: true }),
+		...(query && { searchTokens: { $all: generateQueryTokens(query) } }),
 	};
 	const assistants = await collections.assistants
 		.find(filter)
 		.skip(NUM_PER_PAGE * pageIndex)
-		.sort({ userCount: -1 })
+		.sort({
+			...(sort === SortKey.TRENDING && { last24HoursCount: -1 }),
+			userCount: -1,
+		})
 		.limit(NUM_PER_PAGE)
 		.toArray();
 
@@ -49,5 +56,7 @@ export const load = async ({ url, locals }) => {
 		selectedModel: modelId ?? "",
 		numTotalItems,
 		numItemsPerPage: NUM_PER_PAGE,
+		query,
+		sort,
 	};
 };
